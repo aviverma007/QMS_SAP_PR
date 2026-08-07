@@ -11,8 +11,9 @@ Run:
 Then open http://localhost:5001 (or http://<server-34-ip>:5001) in a browser.
 """
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import requests
+from datetime import datetime
 
 import db_config as cfg
 
@@ -239,6 +240,58 @@ def api_data():
         return jsonify({"ok": True, "rows": rows, "count": len(rows)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
+
+
+@app.route("/odata/PRReportHistory")
+def odata_pr_report_history():
+    """
+    OData-v4-style JSON feed over the SQL Server history table, for SAP
+    Gateway / HTTP destinations to consume directly.
+
+    Query params:
+        $top   - max rows to return (default 100, max 5000)
+        $skip  - rows to skip (for paging)
+    Rows are returned newest-first (by fetched_at).
+    """
+    if not _DB_WRITER_AVAILABLE:
+        return jsonify({"error": "Database module unavailable on server"}), 500
+
+    try:
+        top = min(int(request.args.get("$top", 100)), 5000)
+        skip = int(request.args.get("$skip", 0))
+    except ValueError:
+        return jsonify({"error": "$top and $skip must be integers"}), 400
+
+    try:
+        import pyodbc
+        conn = pyodbc.connect(db_writer._db_connection_string(), autocommit=True)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT * FROM [dbo].[{cfg.TABLE_NAME}] "
+                f"ORDER BY fetched_at DESC "
+                f"OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                skip, top,
+            )
+            columns = [c[0] for c in cur.description]
+            rows = []
+            for record in cur.fetchall():
+                row = {}
+                for col, val in zip(columns, record):
+                    if isinstance(val, datetime):
+                        val = val.isoformat()
+                    row[col] = val
+                rows.append(row)
+        finally:
+            conn.close()
+
+        base = request.url_root.rstrip("/")
+        return jsonify({
+            "@odata.context": f"{base}/odata/$metadata#PRReportHistory",
+            "value": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
