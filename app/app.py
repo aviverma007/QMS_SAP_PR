@@ -26,7 +26,7 @@ except Exception as _e:
 
 app = Flask(__name__)
 
-PORT = 5001
+PORT = 5002
 REFRESH_SECONDS = 5
 
 INDEX_HTML = """
