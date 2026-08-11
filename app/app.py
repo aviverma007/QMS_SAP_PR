@@ -294,6 +294,44 @@ def odata_pr_report_history():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/check_pr")
+def check_pr():
+    """
+    Checks whether a given PR number exists in the SQL Server history
+    table. Returns plain text: 'S' if found, 'E' if not found.
+
+    Usage:
+        http://<server>:5002/check_pr?pr=8110000659
+    """
+    pr_number = request.args.get("pr", "").strip()
+    if not pr_number:
+        return "E", 200, {"Content-Type": "text/plain"}
+
+    if not _DB_WRITER_AVAILABLE:
+        return "E", 200, {"Content-Type": "text/plain"}
+
+    try:
+        import pyodbc
+        conn = pyodbc.connect(db_writer._db_connection_string(), autocommit=True)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT TOP 1 1 FROM [dbo].[{cfg.TABLE_NAME}] WHERE [PR_No] = ?",
+                pr_number,
+            )
+            found = cur.fetchone() is not None
+        finally:
+            conn.close()
+
+        result = "S" if found else "E"
+        return result, 200, {"Content-Type": "text/plain"}
+    except Exception as e:
+        # Fail closed with 'E' rather than leaking an error to a SAP caller
+        # expecting only S/E, but log it server-side for debugging.
+        print(f"[check_pr] ERROR checking PR {pr_number}: {e}")
+        return "E", 200, {"Content-Type": "text/plain"}
+
+
 if __name__ == "__main__":
     if _DB_WRITER_AVAILABLE:
         try:
