@@ -298,17 +298,49 @@ def odata_pr_report_history():
 def check_pr():
     """
     Checks whether a given PR number exists in the SQL Server history
-    table. Returns plain text: 'S' if found, 'E' if not found.
+    table. Returns a structured JSON payload for SAP/ABAP to deserialize.
 
     Usage:
         http://<server>:5002/check_pr?pr=8110000659
+
+    Response shape (found):
+        {
+          "PR_Number": "8110000659",
+          "Status": "S",
+          "Found": true,
+          "Message": "PR number found",
+          "CheckedAt": "2026-08-11T11:20:03",
+          "Details": { ...full matching row, most recent fetch... }
+        }
+
+    Response shape (not found / error / missing param):
+        {
+          "PR_Number": "8110000659",
+          "Status": "E",
+          "Found": false,
+          "Message": "PR number not found",
+          "CheckedAt": "2026-08-11T11:20:03",
+          "Details": null
+        }
     """
     pr_number = request.args.get("pr", "").strip()
+    checked_at = datetime.now().isoformat()
+
+    def make_response(status, found, message, details=None, http_code=200):
+        return jsonify({
+            "PR_Number": pr_number or None,
+            "Status": status,
+            "Found": found,
+            "Message": message,
+            "CheckedAt": checked_at,
+            "Details": details,
+        }), http_code
+
     if not pr_number:
-        return "E", 200, {"Content-Type": "text/plain"}
+        return make_response("E", False, "Missing required parameter 'pr'", http_code=400)
 
     if not _DB_WRITER_AVAILABLE:
-        return "E", 200, {"Content-Type": "text/plain"}
+        return make_response("E", False, "Database module unavailable on server", http_code=500)
 
     try:
         import pyodbc
@@ -316,20 +348,28 @@ def check_pr():
         try:
             cur = conn.cursor()
             cur.execute(
-                f"SELECT TOP 1 1 FROM [dbo].[{cfg.TABLE_NAME}] WHERE [PR_No] = ?",
+                f"SELECT TOP 1 * FROM [dbo].[{cfg.TABLE_NAME}] "
+                f"WHERE [PR_No] = ? ORDER BY fetched_at DESC",
                 pr_number,
             )
-            found = cur.fetchone() is not None
+            columns = [c[0] for c in cur.description]
+            record = cur.fetchone()
         finally:
             conn.close()
 
-        result = "S" if found else "E"
-        return result, 200, {"Content-Type": "text/plain"}
+        if record is not None:
+            details = {}
+            for col, val in zip(columns, record):
+                if isinstance(val, datetime):
+                    val = val.isoformat()
+                details[col] = val
+            return make_response("S", True, "PR number found", details=details)
+        else:
+            return make_response("E", False, "PR number not found")
+
     except Exception as e:
-        # Fail closed with 'E' rather than leaking an error to a SAP caller
-        # expecting only S/E, but log it server-side for debugging.
         print(f"[check_pr] ERROR checking PR {pr_number}: {e}")
-        return "E", 200, {"Content-Type": "text/plain"}
+        return make_response("E", False, "Internal error while checking PR", http_code=500)
 
 
 if __name__ == "__main__":
