@@ -10,8 +10,13 @@ Logs to push_once.log in the same folder.
 """
 
 import sys
+import os
 import traceback
 from datetime import datetime
+
+# Ensure this script's own folder is importable (needed for embeddable/
+# isolated Python distributions, which don't add the script dir automatically).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db_writer
 

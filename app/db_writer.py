@@ -11,10 +11,16 @@ so a new field showing up in the source report doesn't break anything.
 import re
 import time
 import threading
+import os
+import sys
 from datetime import datetime
 
 import requests
 import pyodbc
+
+# Ensure this script's own folder is importable (needed for embeddable/
+# isolated Python distributions, which don't add the script dir automatically).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db_config as cfg
 

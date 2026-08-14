@@ -14,6 +14,12 @@ Then open http://localhost:5001 (or http://<server-34-ip>:5001) in a browser.
 from flask import Flask, jsonify, render_template_string, request
 import requests
 from datetime import datetime
+import os
+import sys
+
+# Ensure this script's own folder is importable (needed for embeddable/
+# isolated Python distributions, which don't add the script dir automatically).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db_config as cfg
 
