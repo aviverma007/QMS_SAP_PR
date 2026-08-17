@@ -30,6 +30,13 @@ except Exception as _e:
     _DB_WRITER_AVAILABLE = False
     _DB_WRITER_IMPORT_ERROR = _e
 
+try:
+    import nfa_tat_writer
+    _NFATAT_WRITER_AVAILABLE = True
+except Exception as _e2:
+    _NFATAT_WRITER_AVAILABLE = False
+    _NFATAT_WRITER_IMPORT_ERROR = _e2
+
 app = Flask(__name__)
 
 PORT = 5002
@@ -378,6 +385,120 @@ def check_pr():
         return make_response("E", False, "Internal error while checking PR", http_code=500)
 
 
+@app.route("/nfatat/odata/PRNFATatReportHistory")
+def odata_nfatat_history():
+    """
+    OData-v4-style JSON feed over the PR/NFA TAT history table.
+
+    Query params:
+        $top   - max rows to return (default 100, max 5000)
+        $skip  - rows to skip (for paging)
+    Rows are returned newest-first (by fetched_at).
+    """
+    if not _NFATAT_WRITER_AVAILABLE:
+        return jsonify({"error": "NFA TAT module unavailable on server"}), 500
+
+    try:
+        top = min(int(request.args.get("$top", 100)), 5000)
+        skip = int(request.args.get("$skip", 0))
+    except ValueError:
+        return jsonify({"error": "$top and $skip must be integers"}), 400
+
+    try:
+        import pyodbc
+        conn = pyodbc.connect(nfa_tat_writer._db_connection_string(), autocommit=True)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT * FROM [dbo].[{cfg.NFATAT_TABLE_NAME}] "
+                f"ORDER BY fetched_at DESC "
+                f"OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                skip, top,
+            )
+            columns = [c[0] for c in cur.description]
+            rows = []
+            for record in cur.fetchall():
+                row = {}
+                for col, val in zip(columns, record):
+                    if isinstance(val, datetime):
+                        val = val.isoformat()
+                    row[col] = val
+                rows.append(row)
+        finally:
+            conn.close()
+
+        base = request.url_root.rstrip("/")
+        return jsonify({
+            "@odata.context": f"{base}/nfatat/odata/$metadata#PRNFATatReportHistory",
+            "value": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/nfatat/check_pr")
+def check_pr_nfatat():
+    """
+    Checks whether a given PR number exists in the PR/NFA TAT history
+    table (rolling window, see NFATAT_ROLLING_DAYS in db_config.py).
+    Returns a structured JSON payload, same shape as /check_pr.
+
+    Usage:
+        http://<server>:5002/nfatat/check_pr?pr=8110000659
+
+    NOTE: NFATAT_PR_COLUMN in db_config.py is a best guess ("PR_No").
+    Verify the actual column name in SSMS after the first run and
+    update db_config.py if it's different.
+    """
+    pr_number = request.args.get("pr", "").strip()
+    checked_at = datetime.now().isoformat()
+
+    def make_response(status, found, message, details=None, http_code=200):
+        return jsonify({
+            "PR_Number": pr_number or None,
+            "Status": status,
+            "Found": found,
+            "Message": message,
+            "CheckedAt": checked_at,
+            "Details": details,
+        }), http_code
+
+    if not pr_number:
+        return make_response("E", False, "Missing required parameter 'pr'", http_code=400)
+
+    if not _NFATAT_WRITER_AVAILABLE:
+        return make_response("E", False, "NFA TAT module unavailable on server", http_code=500)
+
+    try:
+        import pyodbc
+        conn = pyodbc.connect(nfa_tat_writer._db_connection_string(), autocommit=True)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT TOP 1 * FROM [dbo].[{cfg.NFATAT_TABLE_NAME}] "
+                f"WHERE [{cfg.NFATAT_PR_COLUMN}] = ? ORDER BY fetched_at DESC",
+                pr_number,
+            )
+            columns = [c[0] for c in cur.description]
+            record = cur.fetchone()
+        finally:
+            conn.close()
+
+        if record is not None:
+            details = {}
+            for col, val in zip(columns, record):
+                if isinstance(val, datetime):
+                    val = val.isoformat()
+                details[col] = val
+            return make_response("S", True, "PR number found", details=details)
+        else:
+            return make_response("E", False, "PR number not found")
+
+    except Exception as e:
+        print(f"[check_pr_nfatat] ERROR checking PR {pr_number}: {e}")
+        return make_response("E", False, "Internal error while checking PR", http_code=500)
+
+
 if __name__ == "__main__":
     if _DB_WRITER_AVAILABLE:
         try:
@@ -388,6 +509,14 @@ if __name__ == "__main__":
     else:
         print(f"[db_writer] Not available ({_DB_WRITER_IMPORT_ERROR}). "
               f"Run: pip install pyodbc")
+
+    if _NFATAT_WRITER_AVAILABLE:
+        try:
+            nfa_tat_writer.start_background_thread()
+        except Exception as e:
+            print(f"[nfa_tat_writer] Failed to start: {e}")
+    else:
+        print(f"[nfa_tat_writer] Not available ({_NFATAT_WRITER_IMPORT_ERROR})")
 
     print(f"Serving live PR report on http://localhost:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)

@@ -18,3 +18,16 @@ TABLE_NAME = "PRReportHistory"
 
 # Used only by app.py's continuous background writer.
 WRITE_INTERVAL_SECONDS = 45
+
+# --- PR/NFA TAT report (SapPrNFATatReport.php) ---
+# Takes a date range (?startdate=YYYY-MM-DD&enddate=YYYY-MM-DD).
+# The writer below re-pulls a rolling window on every cycle.
+NFATAT_SOURCE_URL_BASE = "https://smartworlddevelopersonline.com/SapPrNFATatReport.php"
+NFATAT_TABLE_NAME = "PRNFATatReportHistory"
+NFATAT_ROLLING_DAYS = 30          # window size: (today - N days) to today
+NFATAT_WRITE_INTERVAL_SECONDS = 300  # 5 minutes -- less frequent than the main PR feed
+
+# Best-guess column name holding the PR number in this report's JSON.
+# CHECK AFTER FIRST RUN: query the new table in SSMS and confirm this
+# matches the actual column name; update if different.
+NFATAT_PR_COLUMN = "PR_No"
