@@ -99,7 +99,7 @@ def ensure_columns(conn, column_names):
     cur = conn.cursor()
     for col in missing:
         cur.execute(
-            f"ALTER TABLE [dbo].[{cfg.NFATAT_TABLE_NAME}] ADD [{col}] NVARCHAR(1000) NULL"
+            f"ALTER TABLE [dbo].[{cfg.NFATAT_TABLE_NAME}] ADD [{col}] NVARCHAR(MAX) NULL"
         )
     conn.commit()
     _known_columns.update(missing)
