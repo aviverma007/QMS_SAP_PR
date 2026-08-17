@@ -499,6 +499,157 @@ def check_pr_nfatat():
         return make_response("E", False, "Internal error while checking PR", http_code=500)
 
 
+@app.route("/nfatat/search")
+def nfatat_search():
+    """
+    Combined filter endpoint for the PR/NFA TAT history table.
+
+    Rules:
+      - If 'pr' is given: returns that specific PR's most recent record
+        (S/E style payload), same as /nfatat/check_pr. If a date range
+        is ALSO given, the PR lookup is additionally restricted to that
+        window.
+      - Else if 'startdate' and/or 'enddate' is given (no 'pr'): returns
+        ALL PR records captured within that date range (based on
+        fetched_at, i.e. when this app captured the data -- not
+        necessarily a business date field in the source report).
+      - If neither is given: returns an error asking for at least one.
+
+    Usage:
+        http://<server>:5002/nfatat/search?pr=8110000659
+        http://<server>:5002/nfatat/search?startdate=2026-08-01&enddate=2026-08-17
+        http://<server>:5002/nfatat/search?pr=8110000659&startdate=2026-08-01&enddate=2026-08-17
+
+    Dates must be YYYY-MM-DD. $top caps date-range results (default 500, max 5000).
+    """
+    pr_number = request.args.get("pr", "").strip()
+    startdate = request.args.get("startdate", "").strip()
+    enddate = request.args.get("enddate", "").strip()
+    checked_at = datetime.now().isoformat()
+
+    def parse_date(s, label):
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"'{label}' must be in YYYY-MM-DD format, got '{s}'")
+
+    if not _NFATAT_WRITER_AVAILABLE:
+        return jsonify({"error": "NFA TAT module unavailable on server"}), 500
+
+    try:
+        start_dt = parse_date(startdate, "startdate")
+        end_dt = parse_date(enddate, "enddate")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    # --- Case 1: PR number given -> single-PR lookup, optionally date-bounded ---
+    if pr_number:
+        def make_pr_response(status, found, message, details=None, http_code=200):
+            return jsonify({
+                "Filter": "pr",
+                "PR_Number": pr_number,
+                "Status": status,
+                "Found": found,
+                "Message": message,
+                "CheckedAt": checked_at,
+                "Details": details,
+            }), http_code
+
+        try:
+            import pyodbc
+            conn = pyodbc.connect(nfa_tat_writer._db_connection_string(), autocommit=True)
+            try:
+                cur = conn.cursor()
+                where = [f"[{cfg.NFATAT_PR_COLUMN}] = ?"]
+                params = [pr_number]
+                if start_dt:
+                    where.append("fetched_at >= ?")
+                    params.append(start_dt)
+                if end_dt:
+                    where.append("fetched_at < DATEADD(day, 1, ?)")
+                    params.append(end_dt)
+                query = (
+                    f"SELECT TOP 1 * FROM [dbo].[{cfg.NFATAT_TABLE_NAME}] "
+                    f"WHERE {' AND '.join(where)} ORDER BY fetched_at DESC"
+                )
+                cur.execute(query, params)
+                columns = [c[0] for c in cur.description]
+                record = cur.fetchone()
+            finally:
+                conn.close()
+
+            if record is not None:
+                details = {}
+                for col, val in zip(columns, record):
+                    if isinstance(val, datetime):
+                        val = val.isoformat()
+                    details[col] = val
+                return make_pr_response("S", True, "PR number found", details=details)
+            else:
+                return make_pr_response("E", False, "PR number not found")
+
+        except Exception as e:
+            print(f"[nfatat_search] ERROR checking PR {pr_number}: {e}")
+            return make_pr_response("E", False, "Internal error while checking PR", http_code=500)
+
+    # --- Case 2: date range given, no PR -> all PRs in that window ---
+    elif start_dt or end_dt:
+        try:
+            top = min(int(request.args.get("$top", 500)), 5000)
+        except ValueError:
+            return jsonify({"error": "$top must be an integer"}), 400
+
+        try:
+            import pyodbc
+            conn = pyodbc.connect(nfa_tat_writer._db_connection_string(), autocommit=True)
+            try:
+                cur = conn.cursor()
+                where = []
+                params = []
+                if start_dt:
+                    where.append("fetched_at >= ?")
+                    params.append(start_dt)
+                if end_dt:
+                    where.append("fetched_at < DATEADD(day, 1, ?)")
+                    params.append(end_dt)
+                query = (
+                    f"SELECT TOP {top} * FROM [dbo].[{cfg.NFATAT_TABLE_NAME}] "
+                    f"WHERE {' AND '.join(where)} ORDER BY fetched_at DESC"
+                )
+                cur.execute(query, params)
+                columns = [c[0] for c in cur.description]
+                rows = []
+                for record in cur.fetchall():
+                    row = {}
+                    for col, val in zip(columns, record):
+                        if isinstance(val, datetime):
+                            val = val.isoformat()
+                        row[col] = val
+                    rows.append(row)
+            finally:
+                conn.close()
+
+            return jsonify({
+                "Filter": "date",
+                "StartDate": startdate or None,
+                "EndDate": enddate or None,
+                "CheckedAt": checked_at,
+                "Count": len(rows),
+                "Rows": rows,
+            })
+        except Exception as e:
+            print(f"[nfatat_search] ERROR on date range search: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # --- Case 3: neither given ---
+    else:
+        return jsonify({
+            "error": "Provide at least one filter: 'pr', or 'startdate'/'enddate'"
+        }), 400
+
+
 if __name__ == "__main__":
     if _DB_WRITER_AVAILABLE:
         try:
