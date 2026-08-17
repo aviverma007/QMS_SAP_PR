@@ -28,6 +28,6 @@ NFATAT_ROLLING_DAYS = 30          # window size: (today - N days) to today
 NFATAT_WRITE_INTERVAL_SECONDS = 300  # 5 minutes -- less frequent than the main PR feed
 
 # Best-guess column name holding the PR number in this report's JSON.
-# CHECK AFTER FIRST RUN: query the new table in SSMS and confirm this
-# matches the actual column name; update if different.
-NFATAT_PR_COLUMN = "PR_No"
+# Confirmed via SSMS: this report uses EPR_No (format like 0000010720),
+# not PR_No -- that field only exists in the other report's table.
+NFATAT_PR_COLUMN = "EPR_No"
