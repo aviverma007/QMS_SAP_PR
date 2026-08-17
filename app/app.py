@@ -670,4 +670,4 @@ if __name__ == "__main__":
         print(f"[nfa_tat_writer] Not available ({_NFATAT_WRITER_IMPORT_ERROR})")
 
     print(f"Serving live PR report on http://localhost:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
