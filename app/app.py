@@ -39,7 +39,7 @@ except Exception as _e2:
 
 app = Flask(__name__)
 
-PORT = 5002
+PORT = 8000
 REFRESH_SECONDS = 5
 
 INDEX_HTML = """
