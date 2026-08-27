@@ -157,6 +157,16 @@ def fetch_and_store():
         sanitized_rows.append(sanitized)
         all_columns.update(sanitized.keys())
 
+    # The source report can contain the same EPR_No on multiple rows
+    # (line items / approval steps). Keep only the LAST occurrence per
+    # key so the upsert has one row per EPR_No.
+    deduped = {}
+    for row in sanitized_rows:
+        key = row.get(KEY_COLUMN)
+        if key is not None:
+            deduped[str(key)] = row
+    sanitized_rows = list(deduped.values())
+
     data_columns = sorted(all_columns - META_COLUMNS)
     now = datetime.now()
     inserted = updated = unchanged = 0
