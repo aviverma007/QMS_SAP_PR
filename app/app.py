@@ -39,6 +39,15 @@ except Exception as _e2:
 
 app = Flask(__name__)
 
+# ── Access log (Werkzeug request lines → access.log, rotating 5 MB × 3) ──
+import logging
+from logging.handlers import RotatingFileHandler as _RFH
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "access.log")
+_h = _RFH(_log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
+_h.setLevel(logging.INFO)
+logging.getLogger("werkzeug").addHandler(_h)
+logging.getLogger("werkzeug").setLevel(logging.INFO)
+
 PORT = 5002
 REFRESH_SECONDS = 5
 
