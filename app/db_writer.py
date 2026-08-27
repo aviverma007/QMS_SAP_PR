@@ -1,11 +1,14 @@
 """
-Writes live PR report data into SQL Server (192.168.66.33) as a
-timestamped history log. Every fetch adds new rows -- nothing is
-overwritten -- so the table becomes a full history over time.
+Upsert writer for the live PR report -> SQL Server.
 
-Database, table, and columns are all created automatically. Columns
-are detected dynamically from whatever keys are present in the JSON,
-so a new field showing up in the source report doesn't break anything.
+One row per PR_No in dbo.PRReportHistory:
+  - New PR in the report        -> INSERT (with first_seen = now)
+  - Existing PR, data changed   -> UPDATE that row (fetched_at = now)
+  - Existing PR, data identical -> no write at all
+
+Daily growth is therefore only the handful of genuinely new PRs
+(typically 5-10/day) instead of full-report snapshots every 45s.
+Columns are still auto-detected from the JSON and auto-added.
 """
 
 import re
@@ -18,14 +21,14 @@ from datetime import datetime
 import requests
 import pyodbc
 
-# Ensure this script's own folder is importable (needed for embeddable/
-# isolated Python distributions, which don't add the script dir automatically).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import db_config as cfg
 
 _lock = threading.Lock()
 _known_columns = set()
+
+KEY_COLUMN = "PR_No"
+META_COLUMNS = {"id", "fetched_at", "first_seen", KEY_COLUMN}
 
 
 def _sanitize_column_name(raw_name):
@@ -75,15 +78,10 @@ def ensure_table_exists(conn):
     cur.execute(
         "IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = ?) "
         "EXEC('CREATE TABLE [dbo].[' + ? + '] ("
-        "id BIGINT IDENTITY(1,1) PRIMARY KEY, "
-        "fetched_at DATETIME2 NOT NULL DEFAULT SYSDATETIME())')",
+        "[PR_No] NVARCHAR(100) NOT NULL PRIMARY KEY, "
+        "fetched_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(), "
+        "first_seen DATETIME2 NOT NULL DEFAULT SYSDATETIME())')",
         cfg.TABLE_NAME, cfg.TABLE_NAME,
-    )
-    conn.commit()
-
-    cur.execute(
-        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_fetched_at') "
-        f"CREATE INDEX ix_fetched_at ON [dbo].[{cfg.TABLE_NAME}] (fetched_at)"
     )
     conn.commit()
 
@@ -93,6 +91,15 @@ def ensure_table_exists(conn):
     )
     global _known_columns
     _known_columns = {row[0] for row in cur.fetchall()}
+
+    # first_seen may be missing on a pre-migration table
+    if "first_seen" not in _known_columns:
+        cur.execute(
+            f"ALTER TABLE [dbo].[{cfg.TABLE_NAME}] "
+            f"ADD first_seen DATETIME2 NOT NULL DEFAULT SYSDATETIME()"
+        )
+        conn.commit()
+        _known_columns.add("first_seen")
 
 
 def ensure_columns(conn, column_names):
@@ -120,12 +127,26 @@ def normalize_rows(data):
     return []
 
 
+def _load_existing(conn, data_columns):
+    """Return {pr_no: {col: value}} for every row currently in the table."""
+    cur = conn.cursor()
+    cols = [KEY_COLUMN] + list(data_columns)
+    col_list = ", ".join(f"[{c}]" for c in cols)
+    cur.execute(f"SELECT {col_list} FROM [dbo].[{cfg.TABLE_NAME}]")
+    existing = {}
+    for rec in cur.fetchall():
+        key = rec[0]
+        existing[str(key)] = {c: rec[i + 1] for i, c in enumerate(data_columns)}
+    return existing
+
+
 def fetch_and_store():
+    """Upsert the current report. Returns (inserted, updated, unchanged)."""
     resp = requests.get(cfg.SOURCE_URL, timeout=15)
     resp.raise_for_status()
     rows = normalize_rows(resp.json())
     if not rows:
-        return 0
+        return (0, 0, 0)
 
     sanitized_rows = []
     all_columns = set()
@@ -134,29 +155,61 @@ def fetch_and_store():
         sanitized_rows.append(sanitized)
         all_columns.update(sanitized.keys())
 
-    fetched_at = datetime.now()
+    data_columns = sorted(all_columns - META_COLUMNS)
+    now = datetime.now()
+    inserted = updated = unchanged = 0
 
     with _lock:
         conn = pyodbc.connect(_db_connection_string(), autocommit=False)
         try:
             ensure_columns(conn, all_columns)
+            existing = _load_existing(conn, data_columns)
             cur = conn.cursor()
+
             for row in sanitized_rows:
-                cols = ["fetched_at"] + list(row.keys())
-                placeholders = ", ".join(["?"] * len(cols))
-                col_list = ", ".join(f"[{c}]" for c in cols)
-                values = [fetched_at] + [
-                    None if v is None else str(v) for v in row.values()
-                ]
-                cur.execute(
-                    f"INSERT INTO [dbo].[{cfg.TABLE_NAME}] ({col_list}) VALUES ({placeholders})",
-                    values,
-                )
+                pr_no = row.get(KEY_COLUMN)
+                if pr_no is None:
+                    continue
+                pr_no = str(pr_no)
+                new_vals = {
+                    c: (None if row.get(c) is None else str(row.get(c)))
+                    for c in data_columns
+                }
+
+                if pr_no not in existing:
+                    cols = [KEY_COLUMN, "fetched_at", "first_seen"] + data_columns
+                    placeholders = ", ".join(["?"] * len(cols))
+                    col_list = ", ".join(f"[{c}]" for c in cols)
+                    values = [pr_no, now, now] + [new_vals[c] for c in data_columns]
+                    cur.execute(
+                        f"INSERT INTO [dbo].[{cfg.TABLE_NAME}] ({col_list}) "
+                        f"VALUES ({placeholders})",
+                        values,
+                    )
+                    inserted += 1
+                else:
+                    old_vals = {
+                        c: (None if existing[pr_no][c] is None else str(existing[pr_no][c]))
+                        for c in data_columns
+                    }
+                    if old_vals != new_vals:
+                        set_list = ", ".join(f"[{c}] = ?" for c in data_columns)
+                        values = [new_vals[c] for c in data_columns] + [now, pr_no]
+                        cur.execute(
+                            f"UPDATE [dbo].[{cfg.TABLE_NAME}] "
+                            f"SET {set_list}, fetched_at = ? "
+                            f"WHERE [{KEY_COLUMN}] = ?",
+                            values,
+                        )
+                        updated += 1
+                    else:
+                        unchanged += 1
+
             conn.commit()
         finally:
             conn.close()
 
-    return len(sanitized_rows)
+    return (inserted, updated, unchanged)
 
 
 def init():
@@ -172,12 +225,14 @@ def init():
 def run_forever(interval_seconds=None):
     interval = interval_seconds or cfg.WRITE_INTERVAL_SECONDS
     init()
-    print(f"[db_writer] Writing to {cfg.DB_SERVER}/{cfg.DB_NAME}.dbo.{cfg.TABLE_NAME} "
-          f"every {interval}s")
+    print(f"[db_writer] Upserting to {cfg.DB_SERVER}/{cfg.DB_NAME}.dbo.{cfg.TABLE_NAME} "
+          f"every {interval}s (one row per {KEY_COLUMN})")
     while True:
         try:
-            n = fetch_and_store()
-            print(f"[db_writer] {datetime.now().strftime('%H:%M:%S')} wrote {n} rows")
+            ins, upd, same = fetch_and_store()
+            if ins or upd:
+                print(f"[db_writer] {datetime.now().strftime('%H:%M:%S')} "
+                      f"+{ins} new, ~{upd} updated, {same} unchanged")
         except Exception as e:
             print(f"[db_writer] ERROR: {e}")
         time.sleep(interval)

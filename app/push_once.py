@@ -33,8 +33,8 @@ def log(message):
 def main():
     try:
         db_writer.init()
-        n = db_writer.fetch_and_store()
-        log(f"OK - wrote {n} rows")
+        ins, upd, same = db_writer.fetch_and_store()
+        log(f"OK - +{ins} new, ~{upd} updated, {same} unchanged")
     except Exception:
         log("ERROR:\n" + traceback.format_exc())
         sys.exit(1)
