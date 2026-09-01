@@ -48,6 +48,29 @@ _h.setLevel(logging.INFO)
 logging.getLogger("werkzeug").addHandler(_h)
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 
+# Server-independent access log (Waitress doesn't emit werkzeug lines)
+_access_logger = logging.getLogger("qms.access")
+_access_logger.setLevel(logging.INFO)
+_access_logger.addHandler(_h)
+_access_logger.propagate = False
+
+from flask import request as _rq
+
+@app.after_request
+def _log_request(response):
+    try:
+        _access_logger.info(
+            '%s - - [%s] "%s %s HTTP/1.1" %s -',
+            _rq.remote_addr,
+            datetime.now().strftime("%d/%b/%Y %H:%M:%S"),
+            _rq.method,
+            _rq.full_path.rstrip("?"),
+            response.status_code,
+        )
+    except Exception:
+        pass
+    return response
+
 PORT = 5002
 REFRESH_SECONDS = 5
 
@@ -679,4 +702,12 @@ if __name__ == "__main__":
         print(f"[nfa_tat_writer] Not available ({_NFATAT_WRITER_IMPORT_ERROR})")
 
     print(f"Serving live PR report on http://localhost:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    try:
+        from waitress import serve
+        print(f"[server] Waitress production WSGI server, 8 threads, port {PORT}")
+        serve(app, host="0.0.0.0", port=PORT, threads=8,
+              connection_limit=200, channel_timeout=60)
+    except ImportError:
+        print("[server] WARNING: waitress not installed - falling back to Flask dev server. "
+              "Run: pip install waitress")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
