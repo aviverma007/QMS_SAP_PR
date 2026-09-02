@@ -1,182 +1,160 @@
-# QMS SAP PR Integration — Final Setup & Runbook
+# QMS_SAP_PR — Operations Runbook
 
-**Server:** 192.168.66.34 (app) / 192.168.66.33 (SQL Server)
-**Repo:** https://github.com/aviverma007/QMS_SAP_PR
-**Last updated:** 2026-08-18
+Last updated: 02-Sep-2026 (post 10 GB incident + upsert redesign + Waitress)
 
----
+## 1. What this system is
 
-## 1. What This System Does
+Python service on **server 34 (192.168.66.34)**, port **5002**, run as Windows
+service **QMSPRApp** via NSSM. It:
 
-Two SAP reports are continuously pulled from `smartworlddevelopersonline.com`,
-written into SQL Server as timestamped history, and exposed via HTTP
-endpoints so SAP (via SM59/RFC destinations) can query PR status directly.
+- Fetches the SAP PR report every **45s** and the NFA TAT report every **300s**
+- **Upserts** into SQL Server (**192.168.66.33**, DB `QMS_PR_Report`):
+  one row per `PR_No` in `PRReportHistory`, one row per `EPR_No` in
+  `PRNFATatReportHistory`. New PR -> INSERT, changed PR -> UPDATE,
+  identical -> no write. Growth: ~5-10 rows/day.
+- Serves `/check_pr`, `/nfatat/check_pr`, `/nfatat/search`, `/api/data`,
+  `/odata/*` for SAP (SM59 destinations ZPR_CHECK_TEST / ZPR_CHECK_LIST)
+  and the live browser table at `/`.
+- Web server: **Waitress** (8 threads). Access log written by the app itself.
 
-| Report | Source | SQL Table | PR field format |
-|---|---|---|---|
-| PR Report | `SapPrReport.php` | `PRReportHistory` | `8110xxxxxxx` (`PR_No`) |
-| PR/NFA TAT Report | `SapPrNFATatReport.php` | `PRNFATatReportHistory` | `0000xxxxxx` (`EPR_No`) |
+Key paths on server 34:
 
-**These two reports track different scopes of data.** Not every PR in
-the first report will have a matching entry in the second — only PRs
-that went through NFA approval appear there. This is expected, not a bug.
+| Thing | Path |
+|---|---|
+| App | `D:\smartdesk_live\QMS_SAP_PR\app\app.py` |
+| Python | `D:\smartdesk_live\python312\python.exe` |
+| NSSM | `D:\smartdesk_live\nssm\nssm-2.24\win64\nssm.exe` |
+| Activity log | `app\service_stdout.log` |
+| Access log | `app\access.log` (rotating 5 MB x3) |
+| Error log | `app\service_stderr.log` |
 
----
+## 2. Daily operation
 
-## 2. Current Live Endpoints (port 5002)
-
-```
-http://192.168.66.34:5002/check_pr?pr=<PR_NUMBER>
-http://192.168.66.34:5002/odata/PRReportHistory?$top=100&$skip=0
-
-http://192.168.66.34:5002/nfatat/check_pr?pr=<EPR_NUMBER>
-http://192.168.66.34:5002/nfatat/search?pr=<EPR_NUMBER>&startdate=<YYYY-MM-DD>&enddate=<YYYY-MM-DD>
-http://192.168.66.34:5002/nfatat/odata/PRNFATatReportHistory?$top=100&$skip=0
-```
-
-`/nfatat/search` parameters are all optional and independent — PR only,
-dates only, or both together all work in the same URL.
-
-**Direct SQL access (read-only):**
-- Server: `192.168.66.33`, Port `1433`, DB `QMS_PR_Report`
-- Login: `qms_pr_reader` (password set separately, not stored in repo)
-
----
-
-## 3. Server 34 Setup (what's actually running)
-
-- **App runs as a Windows service** named `QMSPRApp` (via NSSM), not a manual
-  terminal process. Auto-restarts on crash, survives reboot/logoff.
-  - Install location: `D:\smartdesk_live\QMS_SAP_PR\app`
-  - Python: `D:\smartdesk_live\python312\python.exe` (embeddable distro)
-  - NSSM: `D:\smartdesk_live\nssm\nssm-2.24\win64\nssm.exe`
-  - Logs (once configured): `service_stdout.log`, `service_stderr.log` in the app folder
-- **Firewall rule:** `QMS PR Report App`, inbound TCP 5002, all profiles.
-  *(Note: duplicate copies of this rule exist from testing other ports —
-  harmless but worth cleaning up with `Get-NetFirewallRule -DisplayName
-  "QMS PR Report App"` and removing extras.)*
-- **Routing:** persistent default route added (`route -p add 0.0.0.0 mask
-  0.0.0.0 192.168.66.1 metric 1`) to resolve a dual-gateway conflict that
-  was causing intermittent outbound traffic to go out the wrong interface.
-- **Port 8000 is NOT usable on this server** — permanently occupied by
-  `MediaServer.exe` (eSSL BioCVSecurity, likely tied to biometric
-  attendance hardware). Do not attempt to reclaim this port without
-  looping in whoever manages the attendance system.
-
----
-
-## 4. SQL Server Setup (192.168.66.33)
-
-Run once, in order, via SSMS:
-1. `sql/create_database.sql` — creates `QMS_PR_Report` DB + `PRReportHistory` table
-2. `sql/create_readonly_login.sql` — creates `qms_pr_reader` login (change password first)
-3. `sql/widen_nfatat_columns.sql` — one-time fix for a truncation bug (already applied)
-
-Tables auto-create/auto-widen their own columns as new fields appear in
-the source JSON — no manual schema maintenance needed going forward.
-
----
-
-## 5. SAP-Side Status (as of last check)
-
-| Environment | Host | Status |
-|---|---|---|
-| Development | `vhsmwds4ci.sap.smartworlddevelopers.com` | Working, but **intermittent** — has flipped between success and `NIECONN_REFUSED` multiple times with nothing changed on server 34. Root cause not fully identified — likely a network-path issue outside our control (see Section 7). |
-| Quality | `vhsmwqs4ci.sap.smartworlddevelopers.com` | Blocked by Squid proxy (`vhsmwsingwc.sin.sap.smartworlddevelopers.com`), 403 Forbidden / `ERR_ACCESS_DENIED`. Escalation email sent, awaiting infra fix (whitelist or proxy bypass for `192.168.66.0/24`). |
-| Production | `vhsmwps4ci.sap.smartworlddevelopers.com` | Never actually tested in this process — status unknown. |
-
-SM59 destination used for testing: `ZPR_CHECK_TEST`
-- Host: `192.168.66.34` (no `http://` prefix, no trailing slash — this
-  broke the test once when someone accidentally added it)
-- Port: `5002`
-- Path Prefix: `/check_pr?pr=<test_value>` for connection tests. **For
-  real production use, the PR number must be supplied dynamically by
-  the ABAP program at runtime, not hardcoded in the destination.**
-
----
-
-## 6. Troubleshooting Runbook
-
-If SAP reports `NIECONN_REFUSED` or similar, check server 34 in this order:
+Nothing is required daily. The service self-runs and NSSM auto-restarts it on
+crash (5s throttle). Optional 30-second health glance:
 
 ```powershell
-# 1. Is the service running and clean (no duplicate/conflicting process)?
-Get-Service QMSPRApp
-netstat -ano | findstr :5002
-
-# 2. Is the firewall rule present?
-Get-NetFirewallRule -DisplayName "QMS PR Report App" | Select DisplayName, Enabled, Direction, Action, Profile
-
-# 3. Does it work locally?
-curl "http://localhost:5002/check_pr?pr=8110000192" -UseBasicParsing
-
-# 4. Is routing correct (single default gateway, not two)?
-route print -4
+Get-Service QMSPRApp                                                # Running?
+Get-Content D:\smartdesk_live\QMS_SAP_PR\app\service_stdout.log -Tail 5   # any ERROR?
+curl "http://localhost:5002/check_pr?pr=8110000659" -UseBasicParsing      # 200?
 ```
 
-**If all four come back clean** (as they have every single time we've
-checked in this project so far), the problem is NOT on server 34 — it's
-on the network path or the SAP/proxy side. Do not keep re-troubleshooting
-server 34 in that case; escalate to infra/Basis with the specific SAP
-environment and error shown.
-
-**If the firewall rule is missing:**
-```powershell
-netsh advfirewall firewall add rule name="QMS PR Report App" dir=in action=allow protocol=TCP localport=5002
+Healthy log lines look like:
 ```
-
-**If the route shows two default gateways:**
-```powershell
-route change 0.0.0.0 mask 0.0.0.0 192.168.66.1 metric 1
-route -p add 0.0.0.0 mask 0.0.0.0 192.168.66.1 metric 1
+[db_writer] 14:54:42 +1 new, ~0 updated, 716 unchanged
+[nfa_tat_writer] 15:06:18 +0 new, ~1 updated, 234 unchanged (...)
 ```
+Silence between lines is normal - the writers only print when something changed.
 
-**To update the code after a change is pushed to GitHub:**
+## 3. Deploying a code change
+
 ```powershell
-Stop-Service QMSPRApp
+# Admin PowerShell on server 34
 cd D:\smartdesk_live\QMS_SAP_PR
 git pull
+Restart-Service QMSPRApp
+Start-Sleep 5
+Get-Content app\service_stdout.log -Tail 5    # expect the Waitress banner
+```
+
+`Restart-Service` failing with "Cannot open QMSPRApp service" = you are NOT in
+an admin window. `Start-Process powershell -Verb RunAs` and retry.
+
+## 4. Fresh install / rebuild of the service
+
+```powershell
+# Admin PowerShell
+cd D:\smartdesk_live
+git clone https://github.com/aviverma007/QMS_SAP_PR.git
+D:\smartdesk_live\python312\python.exe -m pip install -r QMS_SAP_PR\requirements.txt
+
+$nssm = "D:\smartdesk_live\nssm\nssm-2.24\win64\nssm.exe"
+& $nssm install QMSPRApp "D:\smartdesk_live\python312\python.exe" "D:\smartdesk_live\QMS_SAP_PR\app\app.py"
+& $nssm set QMSPRApp AppDirectory "D:\smartdesk_live\QMS_SAP_PR\app"
+& $nssm set QMSPRApp AppStdout "D:\smartdesk_live\QMS_SAP_PR\app\service_stdout.log"
+& $nssm set QMSPRApp AppStderr "D:\smartdesk_live\QMS_SAP_PR\app\service_stderr.log"
+& $nssm set QMSPRApp AppEnvironmentExtra "PYTHONUNBUFFERED=1"
+& $nssm set QMSPRApp AppThrottle 5000
 Start-Service QMSPRApp
 ```
 
----
+The app auto-creates the database and tables if missing (PR_No / EPR_No primary
+keys + fetched_at + first_seen). No SQL scripts needed for a fresh start.
 
-## 7. Open / Unresolved Items
+## 5. Incident history and fixes (read before "fixing" anything)
 
-1. **Quality's Squid proxy block** — escalation sent, awaiting infra action.
-2. **Development's intermittent failures** — worked, failed, worked again,
-   with nothing changed on server 34 each time. Suspected causes (unconfirmed):
-   - Dev's SAP hostname may resolve to multiple physical servers (cluster/load
-     balancer), with the firewall path only open on some of them
-   - A stateful firewall/security appliance somewhere in between with
-     inconsistent behavior
-   - Ask infra directly: *"Is vhsmwds4ci a single server or a cluster? If
-     multiple servers, is the firewall rule applied to all of them?"*
-3. **Production** — never tested. Should be verified before considering
-   this fully rolled out.
-4. **Duplicate firewall rules** on server 34 (harmless, but worth cleaning
-   up for clarity):
-   ```powershell
-   Get-NetFirewallRule -DisplayName "QMS PR Report App"
-   ```
-   Remove extras via `Remove-NetFirewallRule` if multiple show up.
-5. **Service crash logging not yet fully confirmed active** — the
-   `AppStdout`/`AppStderr` NSSM settings were added partway through this
-   session. Confirm they're capturing output by checking:
-   ```powershell
-   Get-Content "D:\smartdesk_live\QMS_SAP_PR\app\service_stderr.log" -Tail 20
-   ```
+### 5.1 The 10 GB incident (Aug 25-27, 2026) - RESOLVED
+- Old design snapshotted the FULL report every 45s -> 1.2M rows/day ->
+  SQL Server **Express** hit its hard **10 GB per-database cap** -> every write
+  failed with `filegroup is full` -> new PRs stopped appearing in SAP.
+- Fix: writers rewritten to upsert; bloated tables dropped and rebuilt
+  (29.6M rows -> ~717). DB now ~4 MB, grows ~130 KB/year.
+- If `filegroup is full` EVER returns, something re-introduced bulk inserts -
+  check recent code changes; do NOT try to raise the cap (Express won't allow it).
 
----
+### 5.2 NIECONN_REFUSED from SAP - ONGOING, NETWORK-SIDE, NOT FIXABLE HERE
+Symptom: SM59 tests / the 5-min ZPR job alternate SUCCESS and
+`NIECONN_REFUSED(-10)` in 10-25 minute blocks. Evidence collected 02-Sep:
+- SAP 5-min probe flapped all morning (exact transitions: 10:27 fail,
+  10:57 ok, 11:12 fail, 11:32 ok, 11:37 fail, 11:47 ok, 11:52 fail,
+  12:07 ok, 12:17 fail, 12:27 ok).
+- Access log shows a dashboard client (192.168.10.x) getting 200 EVERY
+  MINUTE through the same windows -> server was continuously reachable
+  on another path.
+- During SAP failure windows, ZERO packets from 26.x arrive -> requests
+  are refused on the network path, not by the app.
+- Server 34's Windows Firewall is DISABLED (all profiles) -> no host-level
+  filtering exists at all.
+- SM59 proxy bypass for 192.168.66.34 configured 27-08 -> failures are on
+  the DIRECT path.
 
-## 8. What NOT To Do
+Conclusion: unstable network path between SAP zone (192.168.26.x) and
+192.168.66.x - likely HA firewall flapping / dual-path routing with
+inconsistent rules. **Only the network team can fix this.** Escalation must
+include the transition timestamps above so they can match their event logs.
 
-- **Don't change the port again.** 5002 is confirmed stable and working
-  on server 34's side. Port 8000 is permanently blocked by attendance
-  software. Port-hopping doesn't fix the Quality/Dev issues, which are
-  network/proxy problems, not port problems.
-- **Don't edit the SM59 Host field to include `http://` or a trailing
-  slash.** Just the bare IP: `192.168.66.34`.
-- **Don't hardcode a specific PR number into the RFC destination's Path
-  Prefix for production use** — that was only ever meant for connection
-  testing.
+DO NOT, when this recurs: restart QMSPRApp, change the port, or edit
+server 34 firewall rules. All were verified irrelevant repeatedly.
+
+Note: source IPs seen from SAP are 192.168.26.26 / .34, NOT the registered
+system IPs (DS4=.35, QS4=.28, PS4=.31) - NAT or separate app servers.
+Any firewall request must cover 192.168.26.0/24, not single IPs.
+
+### 5.3 Windows Firewall state
+Disabled on all profiles (discovered 01-Sep). A correctly-scoped allow rule
+"QMS PR Report App" exists but is NOT being enforced. Decision on enabling
+belongs to infra (risk: locking out RDP). If enabling, first add
+192.168.10.0/24 (dashboard users) to the rule and verify the RDP rule.
+
+### 5.4 NFA TAT duplicate keys
+The NFA TAT source report legitimately contains the same EPR_No on multiple
+rows. The writer dedupes per batch (keeps last occurrence). A PK violation
+on PRNFATatReportHistory means this dedup was removed - restore it.
+
+## 6. Troubleshooting quick table
+
+| Symptom | Cause | Action |
+|---|---|---|
+| SAP: NIECONN_REFUSED, access log silent | Network path flap (5.2) | Escalate to network team with timestamps; wait; job self-heals next cycle |
+| `filegroup is full` in stdout log | Bulk inserts reintroduced (5.1) | Check code; tables should stay ~717 rows |
+| `Cannot open QMSPRApp service` | Non-admin PowerShell | Run as administrator |
+| Port 5002 not listening | Service down and NSSM gave up | `Start-Service QMSPRApp`; check service_stderr.log |
+| "development server" warning in log | waitress not installed | `python.exe -m pip install waitress`, restart |
+| access.log missing | Never written yet or path changed | Restart service; check AppDirectory in NSSM |
+| PK violation EPR_No | Batch dedup removed (5.4) | Restore dedup in nfa_tat_writer.py |
+| New PR not in /check_pr after 2 min | Writer erroring | Check service_stdout.log tail |
+
+## 7. SQL Server notes (192.168.66.33)
+
+- **Express edition: 10 GB hard cap per database.** Current size ~4 MB.
+- Windows Authentication (trusted connection) from server 34.
+- Check size: `SELECT name, size*8/1024 AS MB FROM QMS_PR_Report.sys.database_files;`
+- Tables keep only the LATEST state per PR (plus first_seen). Historical
+  field-change audit was intentionally dropped in the redesign.
+
+## 8. Open items
+
+- [ ] Network escalation for SAP path flapping (5.2) - owner: Anirudh -> infra
+- [ ] Firewall-disabled disclosure to infra/HOD (5.3)
+- [ ] Revoke GitHub PAT used during Aug-Sep sessions
+- [ ] Optional: /health endpoint, nightly DB backup to E:, change-audit table
