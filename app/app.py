@@ -140,6 +140,8 @@ INDEX_HTML = """
   .meta { color: var(--muted); padding: 10px 20px; }
   .err-banner { color: #ff5c5c; padding: 10px 20px; display: none; }
 </style>
+    <!-- IT Manager usage tracking: visits, pages, minutes (fails silently if IT Manager is offline) -->
+    <script async src="http://192.168.66.28:4000/track.js" data-app="QMS_SAP_PR"></script>
 </head>
 <body>
 <header>
